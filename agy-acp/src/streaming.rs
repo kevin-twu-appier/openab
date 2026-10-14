@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::db::{is_narration, show_narration};
-use crate::protobuf::{extract_text_from_step_payload, extract_tool_from_step_payload, is_tool_step_type, tool_call_title};
+use crate::protobuf::{
+    extract_text_from_step_payload, extract_tool_from_step_payload, is_tool_step_type, tool_call_title,
+    tool_title_from_step_payload,
+};
 use crate::types::{JsonRpcNotification, StreamingState};
 
 /// Poll the SQLite DB for new text since `base_step_idx` and emit streaming deltas.
@@ -65,7 +68,7 @@ pub fn poll_streaming_delta(
     };
 
     let mut stmt = match conn.prepare(
-        "SELECT idx, step_type, step_payload FROM steps WHERE idx > ?1 AND (step_type = 15 OR step_type IN (5,7,8,9,17,21,33,101,138)) ORDER BY idx"
+        "SELECT idx, step_type, step_payload FROM steps WHERE idx > ?1 AND (step_type = 15 OR step_type IN (5,7,8,9,17,21,33,101,132,138)) ORDER BY idx"
     ) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -102,6 +105,7 @@ pub fn poll_streaming_delta(
             guard.emitted_len.insert(idx, text.len());
 
             if !new_text.is_empty() {
+                notifications.extend(take_pending_completion(session_id, &mut guard.pending_tool));
                 notifications.push(
                     serde_json::to_string(&JsonRpcNotification {
                         jsonrpc: "2.0",
@@ -120,9 +124,11 @@ pub fn poll_streaming_delta(
         } else if is_tool_step_type(step_type) && !guard.emitted_tool_steps.contains(&idx) {
             if let Some((name, input)) = extract_tool_from_step_payload(&payload) {
                 guard.emitted_tool_steps.insert(idx);
-                let title = tool_call_title(&name, &input);
+                let title = tool_title_from_step_payload(&payload)
+                    .unwrap_or_else(|| tool_call_title(&name, &input));
                 let tool_call_id = format!("agy-{}-{}", idx, step_type);
 
+                notifications.extend(take_pending_completion(session_id, &mut guard.pending_tool));
                 let mut start_update = json!({
                     "sessionUpdate": "tool_call",
                     "toolCallId": tool_call_id,
@@ -143,26 +149,38 @@ pub fn poll_streaming_delta(
                     .unwrap(),
                 );
 
-                notifications.push(
-                    serde_json::to_string(&JsonRpcNotification {
-                        jsonrpc: "2.0",
-                        method: "session/update".to_string(),
-                        params: json!({
-                            "sessionId": session_id,
-                            "update": {
-                                "sessionUpdate": "tool_call_update",
-                                "toolCallId": tool_call_id,
-                                "title": title,
-                                "status": "completed",
-                            },
-                        }),
-                    })
-                    .unwrap(),
-                );
+                guard.pending_tool = Some((tool_call_id, title));
             }
         }
     }
 
     guard.had_updates = guard.had_updates || !notifications.is_empty();
     notifications
+}
+
+/// Complete the running tool call, if any. Call after the agy process exits so the
+/// last tool does not stay running.
+pub fn finish_pending_tool(session_id: &str, state: &Arc<Mutex<StreamingState>>) -> Vec<String> {
+    let mut guard = state.lock().unwrap();
+    take_pending_completion(session_id, &mut guard.pending_tool)
+}
+
+fn take_pending_completion(session_id: &str, pending: &mut Option<(String, String)>) -> Vec<String> {
+    let Some((tool_call_id, title)) = pending.take() else {
+        return Vec::new();
+    };
+    vec![serde_json::to_string(&JsonRpcNotification {
+        jsonrpc: "2.0",
+        method: "session/update".to_string(),
+        params: json!({
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "title": title,
+                "status": "completed",
+            },
+        }),
+    })
+    .unwrap()]
 }
