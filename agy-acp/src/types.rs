@@ -56,6 +56,9 @@ pub struct StreamingState {
     pub last_step_idx: i64,
     pub emitted_len: HashMap<i64, usize>,
     pub emitted_tool_steps: HashSet<i64>,
+    /// Tool call announced but not yet completed: `(tool_call_id, title)`.
+    /// agy has no live tool status, so the call stays running until the next step.
+    pub pending_tool: Option<(String, String)>,
     pub had_updates: bool,
 }
 

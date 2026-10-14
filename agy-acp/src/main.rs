@@ -81,6 +81,7 @@ impl Adapter {
             last_step_idx: initial_step_idx,
             emitted_len: HashMap::new(),
             emitted_tool_steps: HashSet::new(),
+            pending_tool: None,
             had_updates: false,
         }));
 
@@ -128,9 +129,10 @@ impl Adapter {
 
         // Final poll
         {
-            let lines = streaming::poll_streaming_delta(
+            let mut lines = streaming::poll_streaming_delta(
                 &conversations_dir, snapshot.as_ref(), session_id, &streaming_state,
             );
+            lines.extend(streaming::finish_pending_tool(session_id, &streaming_state));
             for line in lines { let _ = out_tx.send(Some(line)); }
         }
 
@@ -699,6 +701,79 @@ mod tests {
         assert_eq!(protobuf::extract_text_from_step_payload(&blob), None);
     }
 
+    fn proto_varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 { out.push((v as u8 & 0x7F) | 0x80); v >>= 7; }
+        out.push(v as u8);
+    }
+
+    fn proto_bytes(field: u64, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        proto_varint((field << 3) | 2, &mut out);
+        proto_varint(bytes.len() as u64, &mut out);
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    /// Tool step payload in agy's step_type 132 shape: field 5 -> 4 holds the call
+    /// (2 = name, 3 = JSON input); field 140 holds repeated `{1: key, 2: value}` metadata.
+    fn tool_step_payload(name: &str, meta: &[(&str, &str)]) -> Vec<u8> {
+        let mut call = proto_bytes(2, name.as_bytes());
+        call.extend(proto_bytes(3, br#"{"query":"up"}"#));
+        let mut blob = proto_bytes(5, &proto_bytes(4, &call));
+        if !meta.is_empty() {
+            let entries: Vec<u8> = meta
+                .iter()
+                .flat_map(|(k, v)| {
+                    let mut kv = proto_bytes(1, k.as_bytes());
+                    kv.extend(proto_bytes(2, v.as_bytes()));
+                    proto_bytes(1, &kv)
+                })
+                .collect();
+            blob.extend(proto_bytes(140, &entries));
+        }
+        blob
+    }
+
+    #[test]
+    fn test_streaming_poll_emits_tool_call_for_step_type_132() {
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-tool-{}", Uuid::new_v4())));
+        let conv_dir = root.join("conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+        let conn = Connection::open(conv_dir.join("tool-conv.db")).unwrap();
+        conn.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL DEFAULT 0, step_payload BLOB)").unwrap();
+        // agy 1.1.25+ stores every tool call as step_type 132; the title comes from toolSummary.
+        let payload = tool_step_payload("call_mcp_tool", &[("ToolName", "query_prometheus"), ("toolSummary", "Query CPU")]);
+        conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 132, ?1)", rusqlite::params![payload]).unwrap();
+        let state = Arc::new(Mutex::new(StreamingState {
+            conversation_id: Some("tool-conv".to_string()), base_step_idx: -1, last_step_idx: -1,
+            emitted_len: HashMap::new(), emitted_tool_steps: HashSet::new(), pending_tool: None, had_updates: false,
+        }));
+
+        let kinds = |lines: Vec<String>| -> Vec<(String, String)> {
+            lines
+                .iter()
+                .map(|l| {
+                    let u = serde_json::from_str::<Value>(l).unwrap()["params"]["update"].clone();
+                    (u["sessionUpdate"].as_str().unwrap().to_string(), u["title"].as_str().unwrap_or("").to_string())
+                })
+                .collect()
+        };
+
+        // The call stays running until agy writes its next step, so clients keep showing it.
+        assert_eq!(kinds(streaming::poll_streaming_delta(&conv_dir, None, "sess-1", &state)), [("tool_call".into(), "Query CPU".into())]);
+        assert!(streaming::poll_streaming_delta(&conv_dir, None, "sess-1", &state).is_empty());
+
+        let next = tool_step_payload("call_mcp_tool", &[("toolSummary", "Query Loki")]);
+        conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (2, 132, ?1)", rusqlite::params![next]).unwrap();
+        assert_eq!(
+            kinds(streaming::poll_streaming_delta(&conv_dir, None, "sess-1", &state)),
+            [("tool_call_update".into(), "Query CPU".into()), ("tool_call".into(), "Query Loki".into())]
+        );
+
+        assert_eq!(kinds(streaming::finish_pending_tool("sess-1", &state)), [("tool_call_update".into(), "Query Loki".into())]);
+        assert!(streaming::finish_pending_tool("sess-1", &state).is_empty());
+    }
+
     #[test]
     fn test_read_varint() {
         assert_eq!(protobuf::read_varint(&[0x05]), Some((5, 1)));
@@ -1172,7 +1247,7 @@ E0707 08:34:23.910604  84 log.go:398] agent executor error: model unreachable: R
         conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 15, ?2)", rusqlite::params![1i64, make_payload("hello")]).unwrap();
         let state = Arc::new(Mutex::new(StreamingState {
             conversation_id: Some("stream-conv".to_string()), base_step_idx: -1, last_step_idx: -1,
-            emitted_len: HashMap::new(), emitted_tool_steps: HashSet::new(), had_updates: false,
+            emitted_len: HashMap::new(), emitted_tool_steps: HashSet::new(), pending_tool: None, had_updates: false,
         }));
         let lines = streaming::poll_streaming_delta(&conv_dir, None, "sess-1", &state);
         assert_eq!(lines.len(), 1);

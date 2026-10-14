@@ -58,9 +58,52 @@ pub fn get_proto_text(blob: &[u8], target: u64) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Check if a step_type represents a tool call.
+/// Collect every length-delimited field with the given number (repeated fields).
+/// Stops at the first malformed byte and returns what was collected so far.
+pub fn get_proto_fields(blob: &[u8], target: u64) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < blob.len() {
+        let Some((tag, consumed)) = read_varint(&blob[i..]) else { break };
+        i += consumed;
+        match tag & 0x7 {
+            0 => match read_varint(&blob[i..]) {
+                Some((_, c)) => i += c,
+                None => break,
+            },
+            2 => {
+                let Some((len, c)) = read_varint(&blob[i..]) else { break };
+                i += c;
+                let len = len as usize;
+                if i + len > blob.len() { break; }
+                if tag >> 3 == target {
+                    out.push(blob[i..i + len].to_vec());
+                }
+                i += len;
+            }
+            5 => i += 4,
+            1 => i += 8,
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Check if a step_type represents a tool call. agy 1.1.25+ writes MCP, shell,
+/// and file tool calls as 132.
 pub fn is_tool_step_type(step_type: i64) -> bool {
-    matches!(step_type, 5 | 7 | 8 | 9 | 17 | 21 | 33 | 101 | 138)
+    matches!(step_type, 5 | 7 | 8 | 9 | 17 | 21 | 33 | 101 | 132 | 138)
+}
+
+/// `toolSummary` value from field 140, a message of repeated `{1: key, 2: value}` entries.
+pub fn tool_title_from_step_payload(blob: &[u8]) -> Option<String> {
+    let meta = get_proto_field(blob, 140)?;
+    get_proto_fields(&meta, 1)
+        .iter()
+        .filter(|e| get_proto_text(e, 1).as_deref() == Some("toolSummary"))
+        .find_map(|e| get_proto_text(e, 2))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Extract tool name and input from a tool step payload.

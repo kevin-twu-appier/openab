@@ -92,7 +92,7 @@ agents:
 
 ## Limitations
 
-- **No streaming**: `agy -p` returns the full response at once; the adapter sends it as a single `agent_message_chunk` notification.
+- **Polled streaming**: the adapter polls agy's conversation DB and emits text deltas and tool calls as they appear.
 - **Cancel is a no-op**: `agy -p` runs to completion; `session/cancel` acknowledges but cannot interrupt.
 
 ## Model Selection
