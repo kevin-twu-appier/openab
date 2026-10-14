@@ -1026,7 +1026,11 @@ impl AdapterRouter {
                                 AcpEvent::ToolStart { id, title } if !title.is_empty() => {
                                     // Live indicator: assistant status line vs emoji reaction.
                                     if assistant_status {
-                                        status_step += 1;
+                                        // Agents refine a running tool's title with more ToolStart events
+                                        // for the same id; count each tool once.
+                                        if !tool_lines.iter().any(|e| e.id == id) {
+                                            status_step += 1;
+                                        }
                                         status_action = sanitize_title(&title);
                                         status_sent_at = tokio::time::Instant::now();
                                         let _ = adapter
