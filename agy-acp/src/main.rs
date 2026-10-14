@@ -741,8 +741,8 @@ mod tests {
         fs::create_dir_all(&conv_dir).unwrap();
         let conn = Connection::open(conv_dir.join("tool-conv.db")).unwrap();
         conn.execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL DEFAULT 0, step_payload BLOB)").unwrap();
-        // agy 1.1.25+ stores every tool call as step_type 132; the title comes from toolSummary.
-        let payload = tool_step_payload("call_mcp_tool", &[("ToolName", "query_prometheus"), ("toolSummary", "Query CPU")]);
+        // agy 1.1.25+ stores every tool call as step_type 132; the title comes from toolAction.
+        let payload = tool_step_payload("call_mcp_tool", &[("ToolName", "query_prometheus"), ("toolSummary", "Query CPU"), ("toolAction", "Querying CPU")]);
         conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 132, ?1)", rusqlite::params![payload]).unwrap();
         let state = Arc::new(Mutex::new(StreamingState {
             conversation_id: Some("tool-conv".to_string()), base_step_idx: -1, last_step_idx: -1,
@@ -760,14 +760,14 @@ mod tests {
         };
 
         // The call stays running until agy writes its next step, so clients keep showing it.
-        assert_eq!(kinds(streaming::poll_streaming_delta(&conv_dir, None, "sess-1", &state)), [("tool_call".into(), "Query CPU".into())]);
+        assert_eq!(kinds(streaming::poll_streaming_delta(&conv_dir, None, "sess-1", &state)), [("tool_call".into(), "Querying CPU".into())]);
         assert!(streaming::poll_streaming_delta(&conv_dir, None, "sess-1", &state).is_empty());
 
         let next = tool_step_payload("call_mcp_tool", &[("toolSummary", "Query Loki")]);
         conn.execute("INSERT INTO steps (idx, step_type, step_payload) VALUES (2, 132, ?1)", rusqlite::params![next]).unwrap();
         assert_eq!(
             kinds(streaming::poll_streaming_delta(&conv_dir, None, "sess-1", &state)),
-            [("tool_call_update".into(), "Query CPU".into()), ("tool_call".into(), "Query Loki".into())]
+            [("tool_call_update".into(), "Querying CPU".into()), ("tool_call".into(), "Query Loki".into())]
         );
 
         assert_eq!(kinds(streaming::finish_pending_tool("sess-1", &state)), [("tool_call_update".into(), "Query Loki".into())]);

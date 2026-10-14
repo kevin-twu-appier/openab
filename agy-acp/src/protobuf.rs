@@ -95,15 +95,19 @@ pub fn is_tool_step_type(step_type: i64) -> bool {
     matches!(step_type, 5 | 7 | 8 | 9 | 17 | 21 | 33 | 101 | 132 | 138)
 }
 
-/// `toolSummary` value from field 140, a message of repeated `{1: key, 2: value}` entries.
+/// Tool title from field 140, a message of repeated `{1: key, 2: value}` entries:
+/// `toolAction` (progressive, for example "Checking Grafana datasource"), else `toolSummary`.
 pub fn tool_title_from_step_payload(blob: &[u8]) -> Option<String> {
     let meta = get_proto_field(blob, 140)?;
-    get_proto_fields(&meta, 1)
-        .iter()
-        .filter(|e| get_proto_text(e, 1).as_deref() == Some("toolSummary"))
-        .find_map(|e| get_proto_text(e, 2))
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    let entries = get_proto_fields(&meta, 1);
+    ["toolAction", "toolSummary"].iter().find_map(|key| {
+        entries
+            .iter()
+            .filter(|e| get_proto_text(e, 1).as_deref() == Some(*key))
+            .find_map(|e| get_proto_text(e, 2))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 /// Extract tool name and input from a tool step payload.
