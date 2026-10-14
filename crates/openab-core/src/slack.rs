@@ -2078,11 +2078,31 @@ fn build_append_stream_body(channel: &str, ts: &str, delta: &str) -> serde_json:
     })
 }
 
+/// Slack renders `loading_messages` in channel threads and ignores custom `status`
+/// text there; each loading message must be at most 50 characters.
+const STATUS_MESSAGE_MAX_CHARS: usize = 50;
+
+/// Body for `assistant.threads.setStatus`. A non-empty status is shown through
+/// `loading_messages`; an empty status clears the indicator.
 fn build_set_status_body(channel_id: &str, thread_ts: &str, status: &str) -> serde_json::Value {
+    if status.is_empty() {
+        return serde_json::json!({
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "status": "",
+        });
+    }
+    let message = if status.chars().count() > STATUS_MESSAGE_MAX_CHARS {
+        let head: String = status.chars().take(STATUS_MESSAGE_MAX_CHARS - 1).collect();
+        format!("{head}…")
+    } else {
+        status.to_string()
+    };
     serde_json::json!({
         "channel_id": channel_id,
         "thread_ts": thread_ts,
-        "status": status,
+        "status": "is working",
+        "loading_messages": [message],
     })
 }
 
@@ -2133,10 +2153,29 @@ mod tests {
 
     #[test]
     fn build_set_status_body_shape() {
-        let b = build_set_status_body("C1", "1700.1", "Thinking\u{2026}");
+        // Channel threads only render loading_messages, so the live text must go there.
+        let b = build_set_status_body("C1", "1700.1", "42s · #13 · Checking Grafana datasource");
         assert_eq!(b["channel_id"], "C1");
         assert_eq!(b["thread_ts"], "1700.1");
-        assert_eq!(b["status"], "Thinking\u{2026}");
+        assert_eq!(b["status"], "is working");
+        assert_eq!(b["loading_messages"][0], "42s · #13 · Checking Grafana datasource");
+    }
+
+    #[test]
+    fn build_set_status_body_caps_message_at_slack_limit() {
+        // Slack rejects the whole call (invalid_arguments) when a loading message exceeds 50 chars.
+        let long = "2m31s · #31 · Finding SparkClusterAllTypesBlacklisted rule details";
+        let msg = build_set_status_body("C1", "1700.1", long)["loading_messages"][0].as_str().unwrap().to_string();
+        assert_eq!(msg.chars().count(), 50);
+        assert!(msg.ends_with('…'));
+        assert!(long.starts_with(msg.trim_end_matches('…')));
+    }
+
+    #[test]
+    fn build_set_status_body_empty_clears() {
+        let b = build_set_status_body("C1", "1700.1", "");
+        assert_eq!(b["status"], "");
+        assert!(b.get("loading_messages").is_none());
     }
 
     #[tokio::test]
