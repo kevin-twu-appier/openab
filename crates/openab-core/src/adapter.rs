@@ -761,8 +761,14 @@ impl AdapterRouter {
                     conn.session_reset = false;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
+                    // Live status: "{elapsed} · #{tools started} · {action}".
+                    let turn_start = tokio::time::Instant::now();
+                    let mut status_step = 0usize;
+                    let mut status_action = String::from("Starting");
                     if assistant_status {
-                        let _ = adapter.set_status(&thread_channel, "Thinking…").await;
+                        let _ = adapter
+                            .set_status(&thread_channel, &format_turn_status(turn_start.elapsed(), status_step, &status_action))
+                            .await;
                     } else {
                         reactions.set_thinking().await;
                     }
@@ -883,7 +889,14 @@ impl AdapterRouter {
                     let mut response_error: Option<String> = None;
                     let mut turn_result = TurnResult::default();
                     let prompt_start = tokio::time::Instant::now();
+                    // Re-send the status before Slack's auto-clear, with the elapsed time updated.
+                    let mut status_sent_at = tokio::time::Instant::now();
                     loop {
+                        let wait = if assistant_status {
+                            status_refresh_wait(liveness_check_interval, status_sent_at.elapsed())
+                        } else {
+                            liveness_check_interval
+                        };
                         let notification = tokio::select! {
                             msg = rx.recv() => match msg {
                                 Some(n) => n,
@@ -913,7 +926,13 @@ impl AdapterRouter {
                                     break;
                                 }
                             },
-                            _ = tokio::time::sleep(liveness_check_interval) => {
+                            _ = tokio::time::sleep(wait) => {
+                                if assistant_status && status_sent_at.elapsed() >= STATUS_REFRESH_INTERVAL {
+                                    let _ = adapter
+                                        .set_status(&thread_channel, &format_turn_status(turn_start.elapsed(), status_step, &status_action))
+                                        .await;
+                                    status_sent_at = tokio::time::Instant::now();
+                                }
                                 if !conn.alive() {
                                     response_error = Some("Agent process died".into());
                                     conn.abandon_request(request_id).await;
@@ -952,6 +971,13 @@ impl AdapterRouter {
                             match event {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
+                                    if assistant_status && status_action != STATUS_WRITING_REPLY {
+                                        status_action = STATUS_WRITING_REPLY.into();
+                                        status_sent_at = tokio::time::Instant::now();
+                                        let _ = adapter
+                                            .set_status(&thread_channel, &format_turn_status(turn_start.elapsed(), status_step, &status_action))
+                                            .await;
+                                    }
                                     if native {
                                         // Lazy stream_begin: open the stream on first text.
                                         if native_msg.is_none() && !stream_begin_failed {
@@ -988,8 +1014,10 @@ impl AdapterRouter {
                                 }
                                 AcpEvent::Thinking => {
                                     if assistant_status {
+                                        status_action = "Thinking".into();
+                                        status_sent_at = tokio::time::Instant::now();
                                         let _ = adapter
-                                            .set_status(&thread_channel, "Thinking…")
+                                            .set_status(&thread_channel, &format_turn_status(turn_start.elapsed(), status_step, &status_action))
                                             .await;
                                     } else {
                                         reactions.set_thinking().await;
@@ -998,11 +1026,15 @@ impl AdapterRouter {
                                 AcpEvent::ToolStart { id, title } if !title.is_empty() => {
                                     // Live indicator: assistant status line vs emoji reaction.
                                     if assistant_status {
+                                        // Agents refine a running tool's title with more ToolStart events
+                                        // for the same id; count each tool once.
+                                        if !tool_lines.iter().any(|e| e.id == id) {
+                                            status_step += 1;
+                                        }
+                                        status_action = sanitize_title(&title);
+                                        status_sent_at = tokio::time::Instant::now();
                                         let _ = adapter
-                                            .set_status(
-                                                &thread_channel,
-                                                &format!("Using {title}…"),
-                                            )
+                                            .set_status(&thread_channel, &format_turn_status(turn_start.elapsed(), status_step, &status_action))
                                             .await;
                                     } else {
                                         reactions.set_tool(&title).await;
@@ -1043,12 +1075,9 @@ impl AdapterRouter {
                                     // tool; send-once delivery slices from here so the
                                     // preceding inter-tool narration is dropped.
                                     answer_start = text_buf.len();
-                                    // Live indicator: assistant status line vs emoji reaction.
-                                    if assistant_status {
-                                        let _ = adapter
-                                            .set_status(&thread_channel, "Thinking…")
-                                            .await;
-                                    } else {
+                                    // The assistant status keeps showing the finished tool until the next
+                                    // event replaces it; reactions go back to thinking.
+                                    if !assistant_status {
                                         reactions.set_thinking().await;
                                     }
                                     // Update the tool's state in BOTH modes (see ToolStart) so the
@@ -1408,6 +1437,32 @@ fn contains_bot_mention(content: &str) -> bool {
         }
     }
     false
+}
+
+const STATUS_WRITING_REPLY: &str = "Writing the reply";
+
+/// Assistant status line: "{elapsed} · #{tools started} · {action}", for example
+/// "2m31s · #31 · Querying Prometheus".
+fn format_turn_status(elapsed: std::time::Duration, step: usize, action: &str) -> String {
+    let secs = elapsed.as_secs();
+    let time = match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    };
+    format!("{time} · #{step} · {action}")
+}
+
+/// Slack clears an assistant thread status after 2 minutes without a new message.
+const STATUS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How long the recv loop may sleep: the liveness cadence, capped so a status
+/// refresh never waits past `STATUS_REFRESH_INTERVAL`.
+fn status_refresh_wait(
+    liveness_check_interval: std::time::Duration,
+    since_status_sent: std::time::Duration,
+) -> std::time::Duration {
+    liveness_check_interval.min(STATUS_REFRESH_INTERVAL.saturating_sub(since_status_sent))
 }
 
 /// Flatten a tool-call title into a single line safe for inline-code spans.
@@ -1902,6 +1957,29 @@ mod tests {
             body,
             "no reset → never prepend (send-once + tools)"
         );
+    }
+
+    #[test]
+    fn turn_status_shows_elapsed_step_and_action() {
+        use std::time::Duration;
+        // Users read elapsed time and step count to tell a running turn from a hung one.
+        assert_eq!(format_turn_status(Duration::from_secs(0), 0, "Starting"), "0s · #0 · Starting");
+        assert_eq!(format_turn_status(Duration::from_secs(42), 13, "Checking Grafana"), "42s · #13 · Checking Grafana");
+        assert_eq!(format_turn_status(Duration::from_secs(151), 31, "Querying"), "2m31s · #31 · Querying");
+        assert_eq!(format_turn_status(Duration::from_secs(3725), 90, "Writing the reply"), "1h02m · #90 · Writing the reply");
+    }
+
+    #[test]
+    fn status_refresh_lands_before_slack_clears_status() {
+        use std::time::Duration;
+        // Slack removes an assistant status after 120s without a new message.
+        assert!(STATUS_REFRESH_INTERVAL < Duration::from_secs(120));
+        let liveness = Duration::from_secs(30);
+        // A recv loop that just sent a status sleeps the normal liveness cadence...
+        assert_eq!(status_refresh_wait(liveness, Duration::ZERO), liveness);
+        // ...but never past the refresh deadline, so the re-send is not delayed by a full tick.
+        assert_eq!(status_refresh_wait(liveness, Duration::from_secs(80)), Duration::from_secs(10));
+        assert_eq!(status_refresh_wait(liveness, Duration::from_secs(200)), Duration::ZERO);
     }
 
     #[test]
